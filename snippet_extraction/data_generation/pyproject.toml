@@ -1,0 +1,40 @@
+[project]
+name = "data-generation"
+version = "0.1.0"
+description = "Corpus building for snippet extraction: LLM-as-labeler over MS MARCO + scraped web docs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "gziz" }]
+dependencies = [
+    "httpx>=0.27",
+    "markdown-it-py>=3.0",
+    "openai>=1.40",
+    "pandas>=2.0",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "syntok>=1.4",
+    "tiktoken>=0.7",
+    "snippets-common",
+]
+
+[project.optional-dependencies]
+# Provider SDKs are optional: the base install ships the OpenAI/Azure path. The
+# Bedrock (default) and Gemini labelers import their SDK lazily and raise a
+# clear error pointing at the matching extra when it is missing.
+bedrock = ["anthropic>=0.40"]
+gemini = ["google-genai>=0.3"]
+all-providers = ["anthropic>=0.40", "google-genai>=0.3"]
+
+[tool.uv.sources]
+snippets-common = { workspace = true }
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["data_generation"]

@@ -1,0 +1,16 @@
+[project]
+name = "snippets-serving"
+version = "0.1.0"
+description = "Serverless Modal deployment of the trained snippet compressor."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "gziz" }]
+dependencies = [
+    "modal>=1.0",
+    "snippets-runtime",
+    "snippets-common",
+]
+
+[tool.uv.sources]
+snippets-runtime = { workspace = true }
+snippets-common = { workspace = true }

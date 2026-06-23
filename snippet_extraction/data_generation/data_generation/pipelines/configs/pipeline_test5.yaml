@@ -1,0 +1,23 @@
+# 5-query smoke run of the full web-corpus pipeline (web sources only).
+queries: data/queries/pipeline_test5.jsonl
+run_dir: data/labels/run_test5
+
+# stage 1: scrape
+retriever: firecrawl
+scrape_limit: 5
+num_results: 5
+extract_depth: advanced
+
+# stage 4: synth_queries_per_doc
+synth_n: 2
+synth_concurrency: 8
+synth_limit: 0
+
+# stage 6: label_units
+provider: bedrock
+prompt_version: v2
+label_concurrency: 10
+label_limit: 0
+
+# stage 7: aggregate — web sources only, no MS MARCO / QASPER fold-in
+extra_inputs: []

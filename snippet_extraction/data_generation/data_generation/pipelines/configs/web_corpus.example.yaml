@@ -1,0 +1,32 @@
+# Example web-corpus pipeline run.
+#
+#   uv run python -m data_generation.pipelines.run_pipeline \
+#       --config data_generation/pipelines/configs/web_corpus.example.yaml
+#
+# Paths are relative to the component root (snippet_extraction/data_generation/),
+# the same root that holds data/. All seven stages write into run_dir with
+# numbered filenames (01_scrape.jsonl ... 07_aggregate.jsonl) plus manifest.json.
+
+queries: data/queries/synth_v1_part3_unused.jsonl
+run_dir: data/labels/run_example
+
+# --- stage 1: scrape -------------------------------------------------------
+retriever: tavily
+scrape_limit: 200
+num_results: 5
+extract_depth: advanced
+# rpm: null          # null = per-retriever default
+
+# --- stage 4: synth_queries_per_doc ---------------------------------------
+synth_n: 2
+synth_concurrency: 8
+synth_limit: 0       # 0 = all
+
+# --- stage 6: label_units --------------------------------------------------
+provider: bedrock
+prompt_version: v2
+label_concurrency: 10
+label_limit: 0       # 0 = all
+
+# --- stage 7: aggregate ----------------------------------------------------
+# Skipping
