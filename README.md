@@ -3,9 +3,6 @@
 Training, data generation, runtime, and serving
 code for producing short, query-relevant snippets from documents.
 
-> This repository is a curated, code-only mirror. It is published for reading and
-> reference; development happens in a private repository and is exported here.
-
 ## Layout
 
 ```
