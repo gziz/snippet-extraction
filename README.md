@@ -1,6 +1,6 @@
-# snippet-extraction
+# Snippet Extraction: Compressing Documents Before They Hit the LLM
 
-Query-aware snippet extraction: training, data generation, runtime, and serving
+Training, data generation, runtime, and serving
 code for producing short, query-relevant snippets from documents.
 
 > This repository is a curated, code-only mirror. It is published for reading and
@@ -21,5 +21,4 @@ Each package is independent and has its own `pyproject.toml` and `README.md`.
 
 ## Not included
 
-To keep this a focused, code-only repo, generated datasets, model checkpoints,
-private notes, and blog/plot image artifacts are intentionally omitted.
+Evals code
