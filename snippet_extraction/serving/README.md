@@ -72,7 +72,7 @@ Long documents are handled transparently: units are packed into 8192-token windo
 **curl:**
 
 ```bash
-curl -X POST https://rev-71693--query-aware-compressor-compressor-compress.modal.run \
+curl -X POST https://<url>.modal.run \
   -H "Content-Type: application/json" \
   -d '{
     "query": "what is the difference between oneOf anyOf and allOf in OpenAPI",
@@ -85,7 +85,7 @@ curl -X POST https://rev-71693--query-aware-compressor-compressor-compress.modal
 ```python
 import httpx
 
-URL = "https://rev-71693--query-aware-compressor-compressor-compress.modal.run"
+URL = "https://<url>.modal.run"
 
 out = httpx.post(URL, json={
     "query": "what is net churn rate in SaaS",
