@@ -3,58 +3,45 @@
 A generic ``query + document -> snippet`` API. The endpoint owns the full
 pipeline so callers need nothing but an HTTP client:
 
-  segment  -> the block-aware segmenter from snippets_common (syntok +
-              markdown-it), i.e. the exact unit definition the training labels
-              were built with. Applied when ``document`` is a raw string; pass
-              a list to skip segmentation and score pre-split units.
-  score    -> windowed ModernBERT inference. Requests are dynamically batched
-              (``@modal.batched``): every window of every document in a batch is
-              flattened into shared GPU minibatches (``compress_long_batch``).
-  select   -> dual-threshold keeping (training-time rule) or, when
-              ``budget_tokens`` is set, score-ranked selection under a
-              per-document cl100k token budget.
-  render   -> kept units joined in document order, non-adjacent runs marked
-              with a ``[...]`` gap.
+  segment  -> the block-aware segmenter from snippets_common (applied when
+              ``document`` is a raw string; pass a list to score pre-split units).
+  score    -> windowed ModernBERT inference on the GPU. The GPU class does *only*
+              the forward pass (``compress_long_batch``); everything off the
+              critical GPU path lives on the CPU endpoint.
+  select   -> dual-threshold keeping or, when ``budget_tokens`` is set,
+              score-ranked selection under a per-document cl100k token budget.
+  render   -> kept units joined in document order, ``[...]`` marking gaps.
 
-The trained checkpoint lives in a Modal Volume (uploaded after training):
+Deploy (CHECKPOINT_NAME must match the uploaded volume dir):
 
-    modal volume create compressor-checkpoints
     modal volume put compressor-checkpoints ./checkpoints/<run> /<run>
-
-Then deploy (CHECKPOINT_NAME below must match the uploaded dir name):
-
     modal deploy modal_app.py
-
-POST the endpoint URL printed on deploy:
-
-    {
-      "query": "...",
-      "document": "raw markdown" | ["unit 0", "unit 1", ...],
-      "token_threshold": 0.5,       # optional
-      "sentence_threshold": 0.5,    # optional
-      "budget_tokens": 400,         # optional; score-ranked selection under cap
-      "min_score": 0.1              # optional; budget-mode floor
-    }
-
-Long documents are handled transparently: `compress_long` packs sentence
-units into encoder-sized windows, so a single endpoint covers both cases.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import modal
 
+if TYPE_CHECKING:
+    # Type-only: keeps the runtime module scope importing nothing but ``modal``
+    # (torch/transformers stay out of a local ``modal deploy``).
+    from snippets_runtime.inference import CompressResult, DocRequest
+
 # Let add_local_python_source() discover the sibling packages at deploy time
 # even when they aren't installed in the local venv (their deps only need to
-# exist inside the container image).
+# exist inside the container image). Keep module scope importing only ``modal``:
+# torch/transformers/snippets_* are imported lazily inside the functions below
+# so a local ``modal deploy`` never needs the heavy deps. Annotations referring
+# to those types stay strings thanks to ``from __future__ import annotations``.
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "runtime"))
 sys.path.insert(0, str(_REPO / "common"))
 
-APP_NAME = "query-aware-compressor-l4"
+APP_NAME = "query-aware-compressor"
 CHECKPOINT_NAME = "run9"  # directory name inside the volume
 VOLUME_MOUNT = "/checkpoints"
 BASE_MODEL = "answerdotai/ModernBERT-base"
@@ -92,41 +79,17 @@ volume = modal.Volume.from_name("compressor-checkpoints", create_if_missing=True
 app = modal.App(APP_NAME)
 
 
-# Burst behaviour, not single-doc cost, drives the tail latency. A real search
-# fan-out fires ~15 docs at once (5 extracts x 3 parallel searches).
-#
-# Levers below, all keeping min_containers=0 -> $0 idle (scale-to-zero):
-#
-#  1. GPU = L40S. The forward is GPU-compute-bound on long docs (a 4-window
-#     extract is ~16 windows of 8192 tokens). The forward is already optimal
-#     (sdpa+bf16; eager is 8x slower, torch.compile/flash-attn add nothing), so
-#     the only way to cut per-window time is the GPU itself. Measured per 8192-
-#     token window: L4 0.29 s vs L40S 0.070 s (~4.2x), which also lands a mixed
-#     ~15-doc burst at ~4 s wall instead of ~10 s on L4. L40S is even slightly
-#     cheaper PER REQUEST than L4 here (it finishes fast enough to offset the
-#     higher hourly rate); the higher hourly rate is the cost-control knob to
-#     watch, not $/request. (APP_NAME still says "l4" for URL stability.)
-#
-#  2. CPU memory snapshot (enable_memory_snapshot + split @enter). The cold path
-#     is dominated by container boot: importing torch/transformers, building the
-#     ModernBERT graph, and loading the checkpoint. Loading the weights ON CPU
-#     inside @enter(snap=True) lets Modal snapshot that whole post-import state;
-#     a subsequent cold start RESTORES the snapshot and only runs @enter(snap=
-#     False) to move the weights to CUDA. Measured end-to-end, scale-from-zero:
-#     ~30.6 s -> ~20.4 s. (The residual ~20 s is infra — GPU provisioning +
-#     snapshot restore + the CPU endpoint hop — and is GPU-type-independent.)
-#     GPU snapshotting (experimental enable_gpu_snapshot) added nothing on top.
-#
-#  3. max_containers=3 caps the fan-out (costs nothing idle). max_batch_size=6
-#     bounds the work any one batch commits to so a burst spreads across the
-#     available containers instead of piling onto one.
-#
-# Burst-from-cold floor: the ~20 s cold start is longer than a ~4 s burst, so
-# newly-autoscaled containers don't arrive in time to help THAT burst — it runs
-# on the already-warm container(s). To cut the cold-burst tail further you'd add
-# a small warm buffer (buffer_containers=1-2): warm headroom kept only while the
-# app is active (drops to 0 when fully idle, so still $0 at rest). Left off by
-# default; turn it on if cold-burst latency matters more than active-period cost.
+# GPU + autoscaling rationale (all levers keep min_containers=0 -> $0 idle):
+#  - gpu="L40S": the forward is GPU-compute-bound on long docs; L40S is ~4x
+#    faster per 8192-token window than L4 and finishes bursts fast enough to be
+#    cheaper PER REQUEST despite the higher hourly rate.
+#  - enable_memory_snapshot: the cold path is dominated by importing
+#    torch/transformers, building the ModernBERT graph, and loading the
+#    checkpoint. Doing that load ON CPU inside @enter(snap=True) lets Modal
+#    snapshot the post-import state; a later cold start restores the snapshot
+#    and only runs @enter(snap=False) to move weights to CUDA (~30s -> ~20s).
+#  - max_containers=3 caps fan-out; max_batch_size=6 bounds per-batch work so a
+#    burst spreads across containers instead of piling onto one.
 @app.cls(
     image=image,
     gpu="L40S",
@@ -142,98 +105,26 @@ class Compressor:
     # checkpoint load into the snapshot.
     @modal.enter(snap=True)
     def load(self):
-        import tiktoken
         from snippets_runtime.inference import load_for_inference
 
         ckpt_dir = f"{VOLUME_MOUNT}/{CHECKPOINT_NAME}"
         self.model, self.tokenizer = load_for_inference(ckpt_dir, base=BASE_MODEL, device="cpu")
-        # cl100k matches the budget metric the eval reports (context_tokens).
-        self._enc = tiktoken.get_encoding("cl100k_base")
 
-    # Runs on every (restored) cold start, once a GPU is attached.
+    # Runs on every (restored) cold start, once a GPU is attached. The snapshot
+    # was taken with no GPU, so the move to CUDA can't happen until now.
     @modal.enter(snap=False)
     def to_gpu(self):
         self.model.to("cuda")
 
-    def _count_tokens(self, text: str) -> int:
-        return len(self._enc.encode(text, disallowed_special=()))
-
     @modal.batched(max_batch_size=6, wait_ms=50)
-    def score(self, reqs: list[dict]) -> list[dict]:
-        """Dynamically-batched scorer.
+    def score(self, doc_reqs: list[DocRequest]) -> list[CompressResult]:
+        """GPU-only forward pass. Modal batches the per-document requests from a
+        search fan-out into one call; every window of every doc is flattened
+        into shared minibatches by ``compress_long_batch``. Segmentation and
+        selection/render happen off this critical path on the CPU endpoint."""
+        from snippets_runtime.inference import compress_long_batch
 
-        Modal accumulates per-document requests — the 5-way fan-out of a single
-        search and any concurrent searches — into one call here. We segment each
-        doc, flatten *every window of every doc* into shared GPU minibatches via
-        ``compress_long_batch`` (one padded forward pass instead of one window at
-        a time), then select + render per document. No lock is needed: a batched
-        method runs one batch at a time per container, so the HF tokenizer is
-        never touched concurrently.
-        """
-        from snippets_common.segment import segment
-        from snippets_common.windowing import render_snippet, select_under_budget
-        from snippets_runtime.inference import DocRequest, compress_long_batch
-
-        # Raw string -> training-faithful units; a list is taken as pre-split.
-        docs_units: list[list[str]] = []
-        doc_reqs: list[DocRequest] = []
-        for r in reqs:
-            document = r["document"]
-            units = segment(document) if isinstance(document, str) else list(document)
-            docs_units.append(units)
-            doc_reqs.append(
-                DocRequest(
-                    query=r["query"],
-                    document=units,
-                    token_threshold=float(r.get("token_threshold", 0.5)),
-                    sentence_threshold=float(r.get("sentence_threshold", 0.5)),
-                )
-            )
-
-        results = compress_long_batch(self.model, self.tokenizer, doc_reqs, device="cuda")
-
-        out: list[dict] = []
-        for r, units, res in zip(reqs, docs_units, results):
-            if not units:
-                out.append(
-                    {
-                        "kept_indices": [],
-                        "kept_sentences": [],
-                        "snippet": "",
-                        "units": [],
-                        "sentence_scores": [],
-                        "sentence_mean_probs": [],
-                        "compression_ratio": 0.0,
-                    }
-                )
-                continue
-            budget = r.get("budget_tokens")
-            if budget is not None:
-                kept = select_under_budget(
-                    units,
-                    res.sentence_mean_probs,
-                    int(budget),
-                    self._count_tokens,
-                    min_score=float(r.get("min_score", 0.1)),
-                )
-            else:
-                kept = res.kept_indices
-
-            kept_sentences = [units[j] for j in kept]
-            snippet = render_snippet(units, kept)
-            total_chars = sum(len(u) for u in units) or 1
-            out.append(
-                {
-                    "kept_indices": kept,
-                    "kept_sentences": kept_sentences,
-                    "snippet": snippet,
-                    "units": units,
-                    "sentence_scores": res.sentence_scores,
-                    "sentence_mean_probs": res.sentence_mean_probs,
-                    "compression_ratio": sum(len(s) for s in kept_sentences) / total_chars,
-                }
-            )
-        return out
+        return compress_long_batch(self.model, self.tokenizer, doc_reqs, device="cuda")
 
 
 def _segment_doc(document: str) -> list[str]:
@@ -241,6 +132,34 @@ def _segment_doc(document: str) -> list[str]:
     from snippets_common.segment import segment
 
     return segment(document)
+
+
+_ENC = None
+
+
+def _count_tokens(text: str) -> int:
+    """cl100k token count, computed on the CPU endpoint (not the GPU container).
+
+    cl100k matches the budget metric the eval reports (context_tokens), so
+    budgeted selection stays calibrated against it.
+    """
+    global _ENC
+    if _ENC is None:
+        import tiktoken
+
+        _ENC = tiktoken.get_encoding("cl100k_base")
+    return len(_ENC.encode(text, disallowed_special=()))
+
+
+_EMPTY_RESPONSE = {
+    "kept_indices": [],
+    "kept_sentences": [],
+    "snippet": "",
+    "units": [],
+    "sentence_scores": [],
+    "sentence_mean_probs": [],
+    "compression_ratio": 0.0,
+}
 
 
 _SEG_POOL = None
@@ -292,6 +211,8 @@ async def compress(req: dict):
     import asyncio
 
     from fastapi import HTTPException
+    from snippets_common.windowing import render_snippet, select_under_budget
+    from snippets_runtime.inference import DocRequest
 
     if not req.get("query") or not req.get("document"):
         raise HTTPException(400, "both 'query' and 'document' are required")
@@ -300,23 +221,63 @@ async def compress(req: dict):
     if isinstance(document, str):
         loop = asyncio.get_running_loop()
         units = await loop.run_in_executor(_seg_pool(), _segment_doc, document)
-        req = {**req, "document": units}
-    return await Compressor().score.remote.aio(req)
+    else:
+        # Pre-split units: score them as given, skipping segmentation.
+        units = list(document)
+
+    if not units:
+        return dict(_EMPTY_RESPONSE)
+
+    dreq = DocRequest(
+        query=req["query"],
+        document=units,
+        token_threshold=float(req.get("token_threshold", 0.5)),
+        sentence_threshold=float(req.get("sentence_threshold", 0.5)),
+    )
+    result = await Compressor().score.remote.aio(dreq)
+
+    budget = req.get("budget_tokens")
+    if budget is not None:
+        kept = select_under_budget(
+            units,
+            result.sentence_mean_probs,
+            int(budget),
+            _count_tokens,
+            min_score=float(req.get("min_score", 0.1)),
+        )
+    else:
+        kept = result.kept_indices
+
+    kept_sentences = [units[j] for j in kept]
+    snippet = render_snippet(units, kept)
+    total_chars = sum(len(u) for u in units) or 1
+    return {
+        "kept_indices": kept,
+        "kept_sentences": kept_sentences,
+        "snippet": snippet,
+        "units": units,
+        "sentence_scores": result.sentence_scores,
+        "sentence_mean_probs": result.sentence_mean_probs,
+        "compression_ratio": sum(len(s) for s in kept_sentences) / total_chars,
+    }
 
 
 @app.local_entrypoint()
 def smoke_test():
-    """`modal run modal_app.py` — round-trip a tiny request through the batched scorer."""
+    """`modal run modal_app.py` — round-trip a tiny request through the scorer."""
     import json
+    from dataclasses import asdict
+
+    from snippets_runtime.inference import DocRequest
 
     out = Compressor().score.remote(
-        {
-            "query": "what is the capital of france",
-            "document": [
+        DocRequest(
+            query="what is the capital of france",
+            document=[
                 "Paris is the capital of France.",
                 "The Eiffel Tower was completed in 1889.",
                 "Bananas are a good source of potassium.",
             ],
-        }
+        )
     )
-    print(json.dumps(out, indent=2))
+    print(json.dumps(asdict(out), indent=2))

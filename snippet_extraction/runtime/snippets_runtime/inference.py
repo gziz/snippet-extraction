@@ -5,6 +5,7 @@ Token probs -> sentence pool (mean) -> dual threshold (token T_tok, sentence T_s
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -269,26 +270,15 @@ class _WindowJob:
     sentence_threshold: float
 
 
-@torch.no_grad()
-def _run_minibatch(
-    model: SentenceCompressor,
-    tokenizer,
-    jobs: list[_WindowJob],
-    *,
-    max_length: int,
-    device,
-    sent_acc: list[list[float]],
-    mean_acc: list[list[float]],
-    kept_acc: list[list[int]],
-) -> None:
-    """Score one padded minibatch of windows; scatter results into accumulators.
+def _tokenize_minibatch(tokenizer, jobs, max_length, timings=None):
+    """Tokenize one padded minibatch on the CPU (no GPU touched).
 
-    All windows in ``jobs`` are tokenized together (``padding=True``) and run
-    through a single forward pass — this is where the GPU gets a wide, uniform
-    batch instead of one window at a time.
+    Returns ``(enc, offsets_b, seq_ids_b)`` with ``enc`` still on CPU — the H2D
+    copy and forward happen in :func:`_forward_and_pool` on the main thread. Kept
+    separate from the forward so the pipeline can prefetch this (GIL-releasing
+    HF-Rust) work on a worker thread while the GPU runs the previous minibatch.
     """
-    if not jobs:
-        return
+    t = time.perf_counter() if timings is not None else 0.0
     enc = tokenizer(
         [j.query for j in jobs],
         [j.body for j in jobs],
@@ -300,13 +290,43 @@ def _run_minibatch(
     )
     offsets_b = enc.pop("offset_mapping").tolist()
     seq_ids_b = [enc.sequence_ids(i) for i in range(len(jobs))]
+    if timings is not None:
+        timings["tokenize"] += time.perf_counter() - t
+    return enc, offsets_b, seq_ids_b
+
+
+@torch.no_grad()
+def _forward_and_pool(
+    model: SentenceCompressor,
+    jobs: list[_WindowJob],
+    prepared,
+    *,
+    device,
+    sent_acc: list[list[float]],
+    mean_acc: list[list[float]],
+    kept_acc: list[list[int]],
+    timings: dict[str, float] | None = None,
+) -> None:
+    """Move a tokenized minibatch to the GPU, run the forward, pool + scatter.
+
+    The GPU-touching half of a minibatch. Runs on the main thread so all CUDA
+    ops (H2D, forward, autocast, D2H sync) stay on one thread while a worker
+    thread prefetches the next minibatch's tokenization.
+    """
+    enc, offsets_b, seq_ids_b = prepared
+    is_cuda = torch.device(device).type == "cuda"
+    t = time.perf_counter() if timings is not None else 0.0
+
     enc = {k: v.to(device) for k, v in enc.items()}
-    if INFERENCE_DTYPE is not None and torch.device(device).type == "cuda":
+    if INFERENCE_DTYPE is not None and is_cuda:
         with torch.autocast("cuda", dtype=INFERENCE_DTYPE):
             logits, _ = model(**enc)
     else:
         logits, _ = model(**enc)
-    probs_b = torch.sigmoid(logits).float().cpu().tolist()
+    probs_b = torch.sigmoid(logits).float().cpu().tolist()  # .cpu() forces the D2H sync
+    if timings is not None:
+        timings["forward"] += time.perf_counter() - t
+        t = time.perf_counter()
 
     for job, offsets, seq_ids, probs in zip(jobs, offsets_b, seq_ids_b, probs_b):
         sent, mean, kept_local = _pool_window(
@@ -322,35 +342,47 @@ def _run_minibatch(
             sent_acc[job.doc_id][gi] = sent[li]
             mean_acc[job.doc_id][gi] = mean[li]
         kept_acc[job.doc_id].extend(job.start + j for j in kept_local)
+    if timings is not None:
+        timings["pool"] += time.perf_counter() - t
 
 
-@torch.no_grad()
-def compress_long_batch(
-    model: SentenceCompressor,
-    tokenizer,
+def _bucket_minibatches(jobs: list[_WindowJob], max_batch_tokens: int) -> list[list[_WindowJob]]:
+    """Length-bucket jobs into padded minibatches under the rows*padded_len cap.
+
+    Jobs are sorted by estimated length and greedily packed (bucketing keeps
+    padding waste low); each returned bucket becomes one padded forward pass.
+    """
+    order = sorted(range(len(jobs)), key=lambda k: jobs[k].est_len)
+    minibatches: list[list[_WindowJob]] = []
+    i = 0
+    while i < len(order):
+        batch: list[_WindowJob] = []
+        max_len = 0
+        while i < len(order):
+            cand = max(max_len, jobs[order[i]].est_len)
+            if batch and cand * (len(batch) + 1) > max_batch_tokens:
+                break
+            batch.append(jobs[order[i]])
+            max_len = cand
+            i += 1
+        minibatches.append(batch)
+    return minibatches
+
+
+def plan_jobs(
     requests: list[DocRequest],
+    tokenizer,
     *,
     max_length: int = 8192,
-    device: torch.device | None = None,
     window_margin: int = 8,
-    max_batch_tokens: int = 16384,
-) -> list[CompressResult]:
-    """Score many documents in shared GPU minibatches.
+) -> tuple[list[list[str]], list[_WindowJob]]:
+    """CPU phase: segment + window every doc into a flat list of jobs.
 
-    Per document this is equivalent to :func:`compress_long`, but every window
-    of every document is flattened into one list, length-bucketed, and run
-    through padded minibatches — so a single ``compress_long_batch`` call replaces
-    ``sum(windows)`` serial forward passes with a handful of batched ones.
-    Per-document results are scattered back in input order. ``max_batch_tokens``
-    caps ``rows * padded_len`` per forward pass to bound GPU memory. The cap is
-    set to ~4 full 8192-token windows per pass: the batch-token sweep measured
-    only 7.4 GiB peak at 16384 on a 24 GiB L4, so doubling it (~15 GiB) halves
-    the number of serial forward passes on long multi-window docs with margin.
+    No model or GPU is touched here — only the tokenizer (host-side) is used to
+    size windows. Returns ``(docs_units, jobs)``: the per-doc unit lists (kept
+    for result assembly) and every encoder-sized window flattened into one job
+    list ready for batched forward passes.
     """
-    device = device or next(model.parameters()).device
-    model.eval()
-
-    # 1. Plan windows for every doc; flatten into one job list.
     docs_units: list[list[str]] = []
     jobs: list[_WindowJob] = []
     for doc_id, req in enumerate(requests):
@@ -382,38 +414,81 @@ def compress_long_batch(
                     sentence_threshold=req.sentence_threshold,
                 )
             )
+    return docs_units, jobs
 
-    # Per-doc accumulators (unscored units default to 0.0 / not kept).
-    sent_acc: list[list[float]] = [[0.0] * len(u) for u in docs_units]
-    mean_acc: list[list[float]] = [[0.0] * len(u) for u in docs_units]
-    kept_acc: list[list[int]] = [[] for _ in docs_units]
 
-    # 2. Length-bucket the jobs and greedily fill minibatches under the
-    #    rows*padded_len budget (bucketing keeps padding waste low).
-    order = sorted(range(len(jobs)), key=lambda k: jobs[k].est_len)
-    i = 0
-    while i < len(order):
-        batch: list[_WindowJob] = []
-        max_len = 0
-        while i < len(order):
-            cand = max(max_len, jobs[order[i]].est_len)
-            if batch and cand * (len(batch) + 1) > max_batch_tokens:
-                break
-            batch.append(jobs[order[i]])
-            max_len = cand
-            i += 1
-        _run_minibatch(
+@torch.no_grad()
+def _run_jobs(
+    model: SentenceCompressor,
+    tokenizer,
+    jobs: list[_WindowJob],
+    *,
+    max_length: int,
+    device,
+    max_batch_tokens: int,
+    sent_acc: list[list[float]],
+    mean_acc: list[list[float]],
+    kept_acc: list[list[int]],
+    timings: dict[str, float] | None = None,
+    pipeline: bool = True,
+) -> None:
+    """GPU phase: bucket jobs into padded minibatches and run the forwards.
+
+    This is the only GPU-bound work in the pipeline. With ``pipeline`` (default),
+    the tokenization of minibatch N+1 is prefetched on a worker thread while the
+    GPU runs the forward of minibatch N: both the HF fast tokenizer and torch's
+    CUDA sync release the GIL, so the CPU-bound tokenize genuinely overlaps the
+    forward and is hidden behind it (only the first minibatch's tokenize can't be
+    overlapped — the pipeline-fill cost). ``pipeline=False`` runs the plain
+    sequential path; the two are equivalent in output and exist to A/B the win.
+    """
+    minibatches = _bucket_minibatches(jobs, max_batch_tokens)
+    if not minibatches:
+        return
+
+    def forward(batch, prepared):
+        _forward_and_pool(
             model,
-            tokenizer,
             batch,
-            max_length=max_length,
+            prepared,
             device=device,
             sent_acc=sent_acc,
             mean_acc=mean_acc,
             kept_acc=kept_acc,
+            timings=timings,
         )
 
-    # 3. Assemble one CompressResult per doc, in input order.
+    # A single minibatch has nothing to overlap, so skip the thread entirely.
+    if not pipeline or len(minibatches) == 1:
+        for batch in minibatches:
+            forward(batch, _tokenize_minibatch(tokenizer, batch, max_length, timings))
+        return
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_tokenize_minibatch, tokenizer, minibatches[0], max_length, timings)
+        for k, batch in enumerate(minibatches):
+            prepared = future.result()  # first iter pays the pipeline-fill tokenize
+            if k + 1 < len(minibatches):
+                # Prefetch N+1's tokenize now so it runs during this forward.
+                future = pool.submit(
+                    _tokenize_minibatch, tokenizer, minibatches[k + 1], max_length, timings
+                )
+            forward(batch, prepared)
+
+
+def assemble_results(
+    docs_units: list[list[str]],
+    sent_acc: list[list[float]],
+    mean_acc: list[list[float]],
+    kept_acc: list[list[int]],
+) -> list[CompressResult]:
+    """CPU phase: fold the per-doc accumulators into one result per document.
+
+    No model or GPU is touched — pure bookkeeping over the pooled scores
+    produced by the run phase. Results come back in input order.
+    """
     results: list[CompressResult] = []
     for units, sent, mean, kept in zip(docs_units, sent_acc, mean_acc, kept_acc):
         if not units:
@@ -442,6 +517,65 @@ def compress_long_batch(
             )
         )
     return results
+
+
+@torch.no_grad()
+def compress_long_batch(
+    model: SentenceCompressor,
+    tokenizer,
+    requests: list[DocRequest],
+    *,
+    max_length: int = 8192,
+    device: torch.device | str | None = None,
+    window_margin: int = 8,
+    max_batch_tokens: int = 16384,
+) -> list[CompressResult]:
+    """Score many documents in shared GPU minibatches.
+
+    Per document this is equivalent to :func:`compress_long`, but every window
+    of every document is flattened into one list, length-bucketed, and run
+    through padded minibatches — so a single ``compress_long_batch`` call replaces
+    ``sum(windows)`` serial forward passes with a handful of batched ones.
+    Per-document results are scattered back in input order. ``max_batch_tokens``
+    caps ``rows * padded_len`` per forward pass to bound GPU memory. The cap is
+    set to ~4 full 8192-token windows per pass: the batch-token sweep measured
+    only 7.4 GiB peak at 16384 on a 24 GiB L4, so doubling it (~15 GiB) halves
+    the number of serial forward passes on long multi-window docs with margin.
+
+    The body is split into three explicit phases so the GPU-bound part is
+    visibly tiny: :func:`plan_jobs` (CPU) → :func:`_run_jobs` (GPU) →
+    :func:`assemble_results` (CPU).
+    """
+    # next(model.parameters()) yields the model's first weight tensor; .device
+    # reads which device it lives on, so callers can omit ``device``.
+    device = device or next(model.parameters()).device
+    model.eval()
+
+    # 1. Plan (CPU): segment + window every doc into a flat job list.
+    docs_units, jobs = plan_jobs(
+        requests, tokenizer, max_length=max_length, window_margin=window_margin
+    )
+
+    # Per-doc accumulators (unscored units default to 0.0 / not kept).
+    sent_acc: list[list[float]] = [[0.0] * len(u) for u in docs_units]
+    mean_acc: list[list[float]] = [[0.0] * len(u) for u in docs_units]
+    kept_acc: list[list[int]] = [[] for _ in docs_units]
+
+    # 2. Run (GPU): the only GPU-bound phase — batched forward passes.
+    _run_jobs(
+        model,
+        tokenizer,
+        jobs,
+        max_length=max_length,
+        device=device,
+        max_batch_tokens=max_batch_tokens,
+        sent_acc=sent_acc,
+        mean_acc=mean_acc,
+        kept_acc=kept_acc,
+    )
+
+    # 3. Assemble (CPU): fold accumulators into per-doc results, in input order.
+    return assemble_results(docs_units, sent_acc, mean_acc, kept_acc)
 
 
 def load_for_inference(
